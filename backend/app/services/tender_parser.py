@@ -109,14 +109,13 @@ class TenderParser:
         structure["qualification_zone"] = self._extract_zone(content, QUALIFICATION_KEYWORDS)
         structure["scoring_zone"] = self._extract_zone(content, SCORING_KEYWORDS)
         structure["technical_zone"] = self._extract_zone(content, ["技术要求", "规格", "参数", "型号"])
-        structure["commercial_zone"] = self._extract_zone(content, COMMERCIAL_KEYWORDS if 'COMMERCIAL_KEYWORDS' in dir() else [])
+        structure["commercial_zone"] = self._extract_zone(content, CONTRACT_KEYWORDS)
         structure["contract_zone"] = self._extract_zone(content, CONTRACT_KEYWORDS)
 
         return structure
 
     def _classify_chapter(self, title: str) -> str:
         """根据章节标题分类"""
-        title_lower = title.lower()
         if any(k in title for k in ["资格", "投标人", "资质", "条件"]):
             return "qualification"
         elif any(k in title for k in ["评标", "评分", "评审"]):

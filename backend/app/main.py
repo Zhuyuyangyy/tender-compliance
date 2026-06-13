@@ -10,10 +10,11 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 import uvicorn
 import json
-import random
 
 from .core.database import init_db
 from .api.routes import router
+from .services.rule_engine import RuleEngine
+from .services.tender_risk_scorer import TenderRiskScorer
 
 
 # ============================================================
@@ -132,27 +133,46 @@ async def detect_collusion_markers(req: CollusionMarkerRequest):
 
 @compliance_router.post("/risk_entropy")
 async def risk_entropy(req: RiskEntropyRequest):
-    """Risk entropy scoring for tender documents"""
+    """Risk entropy scoring for tender documents using RuleEngine + TenderRiskScorer"""
+    engine = RuleEngine()
+    scorer = TenderRiskScorer()
+
+    # Build full document text from clauses for rule engine analysis
+    full_text = req.document_text if req.document_text else "\n".join(req.clause_texts)
+
+    # Detect risks using the rule engine on full document
+    all_risks = engine.detect_risks(full_text)
+
+    # Score each clause individually
     results = []
     for i, clause in enumerate(req.clause_texts):
-        risk_score = round(random.uniform(0.3, 0.95), 3)
-        risk_type = (
-            random.choice(["高金额条款偏离", "排他性条款", "模糊履约标准", "单方面终止权", "过高违约金"])
-            if risk_score > 0.6
-            else random.choice(["正常条款", "合理条款"])
-        )
+        clause_risks = engine.detect_risks(clause)
+        if clause_risks:
+            # Use actual risk scores from detected violations
+            severity_scores = scorer._severity_to_score(clause_risks[0].severity)
+            risk_type = clause_risks[0].risk_name
+        else:
+            severity_scores = 0.0
+            risk_type = "正常条款"
         results.append({
-            "clause_id": i+1,
+            "clause_id": i + 1,
             "clause_preview": clause[:50],
-            "risk_score": risk_score,
+            "risk_score": round(severity_scores, 3),
             "risk_type": risk_type
         })
-    overall = round(sum(r["risk_score"] for r in results) / len(results), 3) if results else 0
-    high_risk = [r for r in results if r["risk_score"] > 0.7]
+
+    # Calculate overall risk using the scorer on all detected risks
+    risk_result = scorer.calculate_tender_risk(all_risks)
+    overall = risk_result["risk_score"]
+
+    high_risk = [r for r in results if r["risk_score"] > 0.6]
     return {
         "tender_id": req.tender_id,
         "clause_count": len(results),
         "overall_risk": overall,
+        "risk_level": risk_result["risk_level"],
+        "coupling_multiplier": risk_result.get("coupling_multiplier", 1.0),
+        "coupling_alerts": risk_result.get("coupling_alerts", []),
         "high_risk_clauses": high_risk,
         "risk_distribution": {
             "critical": sum(1 for r in results if r["risk_score"] > 0.8),
@@ -165,21 +185,51 @@ async def risk_entropy(req: RiskEntropyRequest):
 
 @compliance_router.get("/compare_bids")
 async def compare_bids(tender_id: str, bid_ids: str):
-    """Compare selected bids with price deviation and statistics"""
-    bid_list = bid_ids.split(",")
-    bids = [
-        {
-            "bidder": f"投标方{i+1}",
-            "price": round(random.uniform(80, 120), 2),
-            "technical_score": round(random.uniform(60, 95), 1)
-        }
-        for i in range(len(bid_list))
-    ]
-    prices = [b["price"] for b in bids]
+    """Compare selected bids with price deviation and statistics from database"""
+    from .core.database import get_db_connection
+    from .services.similarity_analyzer import SimilarityAnalyzer
+
+    bid_list = [int(bid_id.strip()) for bid_id in bid_ids.split(",") if bid_id.strip()]
+    if not bid_list:
+        return {"success": False, "message": "No valid bid IDs provided"}
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Fetch actual bid data from database
+    placeholders = ",".join("?" * len(bid_list))
+    cursor.execute(f"SELECT id, bidder_name, content FROM bids WHERE id IN ({placeholders})", bid_list)
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        return {"success": False, "message": "No bids found for given IDs"}
+
+    analyzer = SimilarityAnalyzer()
+    bids = []
+    for row in rows:
+        content = row["content"]
+        price = analyzer._extract_price(content)
+        bids.append({
+            "bid_id": row["id"],
+            "bidder": row["bidder_name"],
+            "price": price,
+            "content_preview": content[:200]
+        })
+
+    prices = [b["price"] for b in bids if b["price"] > 0]
+    if not prices:
+        return {"success": False, "message": "Could not extract prices from bid documents"}
+
     mean_price = sum(prices) / len(prices)
     for b in bids:
-        b["deviation_from_mean"] = round((b["price"] - mean_price) / mean_price * 100, 2)
-    bids_sorted = sorted(bids, key=lambda x: x["technical_score"], reverse=True)
+        if b["price"] > 0 and mean_price > 0:
+            b["deviation_from_mean"] = round((b["price"] - mean_price) / mean_price * 100, 2)
+        else:
+            b["deviation_from_mean"] = 0.0
+
+    bids_sorted = sorted(bids, key=lambda x: x.get("deviation_from_mean", 0), reverse=True)
+
     return {
         "tender_id": tender_id,
         "comparison": bids_sorted,
@@ -188,7 +238,7 @@ async def compare_bids(tender_id: str, bid_ids: str):
             "max": max(prices),
             "mean": round(mean_price, 2),
             "std_dev": round(
-                sum((p - mean_price)**2 for p in prices)**0.5 / len(prices), 2
+                (sum((p - mean_price) ** 2 for p in prices) / len(prices)) ** 0.5, 2
             )
         }
     }
